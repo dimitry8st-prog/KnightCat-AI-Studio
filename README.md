@@ -6,10 +6,12 @@
 
 ## Текущий статус
 
-Проект находится на стадии технического проектирования.
+Минимальный Telegram → AI → Approval → Publish workflow собран и ожидает подключения credentials в n8n.
 
 - [Техническое задание](docs/TECHNICAL_SPEC.md)
-- Реализация n8n workflow — следующий этап
+- [Минимальный n8n workflow](n8n/workflows/knightcat-minimal-telegram.json)
+- [Инструкция по настройке и проверке](n8n/README.md)
+- [Smoke-тесты](n8n/tests/smoke-cases.json)
 - Автоматическая публикация по умолчанию отключена
 - Первый целевой канал публикации — Telegram
 
