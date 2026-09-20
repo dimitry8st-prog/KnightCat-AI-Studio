@@ -47,7 +47,7 @@ MVP принимает текст, URL и голосовые сообщения,
 
 ## Демонстрация
 
-42-секундный ролик с реальными экранами Telegram опубликован в кейсе на [st8dom.ru](https://st8dom.ru/cases/knightcat-content-factory/).
+42-секундный ролик с реальными экранами Telegram:\n\n- [смотреть MP4](media/knightcat-content-factory-16x9.mp4);\n- [постер](media/knightcat-content-factory-poster.jpg);\n- [русские субтитры](media/knightcat-content-factory-ru.vtt);\n- [кейс на st8dom.ru](https://st8dom.ru/cases/knightcat-content-factory/).
 
 ## Автор
 
