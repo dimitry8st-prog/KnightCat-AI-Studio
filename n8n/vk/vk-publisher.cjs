@@ -3,10 +3,19 @@
 const API_BASE = 'https://api.vk.ru/method/';
 const API_VERSION = '5.131';
 const LOCK_TTL_MS = 3 * 60 * 1000;
-const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const RECENT_SCAN_LIMIT = 20;
 
-const AUTH_CODES = new Set([5, 7, 15, 27, 28, 214]);
-const UPLOAD_CODES = new Set([22, 114, 118, 121]);
+const LIMITS = {
+  vk: { min: 500, max: 800 },
+  x: { min: 1, max: 280 },
+  telegram: { min: 1, max: 4096 },
+  instagram: { min: 1, max: 2200 },
+  tiktok: { min: 1, max: 2200 }
+};
+
+const IN_FLIGHT = new Set(['locked', 'uploading', 'publishing']);
+const KNOWN_REJECT_CODES = new Set([5, 7, 15, 22, 27, 28, 114, 118, 121, 214, 219]);
 
 function emptyVkPublication() {
   return {
@@ -18,6 +27,8 @@ function emptyVkPublication() {
     guid: null,
     content_sha256: null,
     locked_at: null,
+    lock_token: null,
+    lock_seq: 0,
     retryable: false,
     error_code: null,
     error_message: null,
@@ -36,6 +47,7 @@ function ensurePublication(pkg) {
     };
   }
   if (!pkg.publication.vk) pkg.publication.vk = emptyVkPublication();
+  if (!pkg.visual) pkg.visual = { prompt: '', image: null };
   return pkg;
 }
 
@@ -68,100 +80,89 @@ function postUrl(groupId, postId) {
 }
 
 function telegramText(pkg, footer) {
-  const base = String(pkg.platforms?.telegram?.content || '');
+  const base = String(pkg.platforms && pkg.platforms.telegram && pkg.platforms.telegram.content || '');
   const foot = String(footer || '').trim();
   return foot ? base + '\n\n' + foot : base;
 }
 
-function redact(text, secrets) {
-  let out = String(text || '');
-  const list = Array.isArray(secrets) ? secrets : [];
-  for (const secret of list) {
-    const value = String(secret || '');
-    if (value.length >= 8) out = out.split(value).join('[redacted]');
-  }
-  return out;
-}
-
-function vkError(code, message, phase, uncertain) {
-  const error = new Error(message);
-  error.code = code;
-  error.phase = phase;
-  error.uncertain = Boolean(uncertain);
-  return error;
-}
-
-function humanize(code, fallback, phase) {
+function humanize(code) {
   const numeric = Number(code);
   const messages = {
-    5: 'Ключ доступа ВКонтакте недействителен. Публикация остановлена, повтор сам не ушёл.',
-    7: 'У ключа доступа недостаточно прав для этого действия.',
-    15: 'ВКонтакте запретил действие. Проверьте права ключа и роль администратора сообщества.',
-    27: 'Метод недоступен ключу сообщества. Фото на стену загружается пользовательским ключом с правом photos.',
-    28: 'Сервисный ключ не может ни загрузить фото на стену, ни опубликовать запись.',
+    5: 'Ключ доступа ВКонтакте недействителен. Запись на стену не создана.',
+    7: 'У ключа доступа недостаточно прав.',
+    15: 'ВКонтакте запретил действие для этого ключа.',
+    27: 'Метод недоступен ключу сообщества. Фото загружает пользовательский ключ с правом photos.',
+    28: 'Сервисный ключ не может загрузить фото или опубликовать запись.',
     214: 'ВКонтакте не разрешил запись на стене. Нужно право wall у ключа этого сообщества.',
     219: 'ВКонтакте отклонил запись как слишком частую. Новый пост не создан.',
     22: 'Сервер ВКонтакте не принял изображение.',
     114: 'Неверный альбом для фотографии стены.',
     118: 'Неверный сервер загрузки изображения.',
     121: 'Неверный хеш загруженного изображения.',
-    image_missing: 'У одобренного черновика нет изображения. Запись на стену не создавалась.',
-    text_missing: 'У одобренного черновика нет текста ВКонтакте. Запись на стену не создавалась.',
-    config: fallback || 'Не заданы идентификатор сообщества или ключи доступа.',
-    attachment: 'ВКонтакте не вернул корректное вложение фотографии. Запись на стену не создавалась.',
-    attachment_owner: 'Фото сохранилось не от имени целевого сообщества. Запись на стену не создавалась.',
+    image_missing: 'В черновике нет изображения. Отправьте идею вместе с фотографией. Запись на стену не создавалась.',
+    text_missing: 'В черновике нет текста ВКонтакте допустимой длины. Запись на стену не создавалась.',
+    config: 'Не задан числовой идентификатор сообщества KNIGHTCAT_VK_GROUP_ID.',
+    attachment: 'ВКонтакте не вернул вложение фотографии. Запись на стену не создавалась.',
+    attachment_owner: 'Фото сохранилось не на стене целевого сообщества. Запись не создавалась.',
     upload_host: 'Адрес загрузки не принадлежит ВКонтакте. Файл не отправлялся.',
-    timeout: 'ВКонтакте не ответил вовремя. Исход публикации неизвестен, повтор не выполнен.',
-    network: phase === 'publish'
-      ? 'Связь оборвалась после запроса публикации. Исход неизвестен, повтор не выполнен.'
-      : 'Не удалось связаться с ВКонтакте во время загрузки изображения. Запись на стену не создавалась.'
+    lock_lost: 'Блокировка публикации принадлежит другому запросу. Этот запрос остановлен.',
+    timeout: 'ВКонтакте не ответил на публикацию. Исход неизвестен, новый пост не создан.',
+    scan_inconclusive: 'В последних 20 записях совпадения нет. Это не доказывает, что пост отсутствует. Новый пост не создан.'
   };
   if (messages[code]) return messages[code];
   if (messages[numeric]) return messages[numeric];
-  return fallback || 'ВКонтакте вернул ошибку.';
+  return 'ВКонтакте вернул ошибку. Запись на стену не создана.';
 }
 
-function interpretVkBody(body, phase) {
-  if (!body || !body.error) return null;
-  const code = body.error.error_code;
-  const uncertain = phase === 'publish' && (code === 1 || code === 10);
-  return vkError(
-    code,
-    body.error.error_msg || humanize(code, 'Ошибка VK API', phase),
-    phase,
-    uncertain
-  );
+function resultOf(pkg, action) {
+  const vk = (pkg.publication && pkg.publication.vk) || emptyVkPublication();
+  return {
+    action,
+    ready: action === 'publish' || action === 'reconcile',
+    status: vk.status,
+    post_id: vk.post_id,
+    url: vk.url,
+    attachment: vk.attachment,
+    error_code: vk.error_code,
+    error_message: vk.error_message,
+    retryable: vk.retryable,
+    lock_token: vk.lock_token
+  };
 }
 
-function classifyTransportError(error, phase) {
-  const raw = String(error && (error.message || error.code) || error || '');
-  const timedOut = /timeout|timed out|ETIMEDOUT|ESOCKETTIMEDOUT|aborted/i.test(raw);
-  const code = timedOut ? 'timeout' : 'network';
-  const uncertain = phase === 'publish';
-  return vkError(code, humanize(code, raw, phase), phase, uncertain);
+function normalizeGroupId(groupId) {
+  const value = String(groupId || '').trim().replace(/^-/, '');
+  if (!/^[1-9]\d*$/.test(value)) return null;
+  return value;
 }
 
-function classifyTokenMaterial(token) {
-  const value = String(token || '').trim();
-  if (!value) return { present: false, type: 'missing' };
-  if (/^vk[12]\./i.test(value)) return { present: true, type: 'vk_id' };
-  return { present: true, type: 'opaque' };
-}
-
-function assertUploadHost(uploadUrl) {
-  let parsed;
-  try {
-    parsed = new URL(String(uploadUrl));
-  } catch (error) {
-    throw vkError('upload_host', humanize('upload_host'), 'upload', false);
+function buildFormBody(fields) {
+  const form = new URLSearchParams();
+  form.set('v', API_VERSION);
+  const source = fields || {};
+  for (const key of Object.keys(source)) {
+    if (key === 'access_token' || key === 'v') continue;
+    if (source[key] !== undefined && source[key] !== null) form.set(key, String(source[key]));
   }
-  const host = parsed.hostname.toLowerCase();
-  const allowed = host === 'vk.ru' || host === 'vk.com'
-    || host.endsWith('.vk.ru') || host.endsWith('.vk.com')
-    || host.endsWith('.userapi.com');
-  if (parsed.protocol !== 'https:' || !allowed) {
-    throw vkError('upload_host', humanize('upload_host'), 'upload', false);
-  }
+  return form.toString();
+}
+
+function buildWallPostParams(groupId, message, attachment, guid) {
+  return {
+    owner_id: -Math.abs(Number(groupId)),
+    from_group: 1,
+    signed: 0,
+    message: String(message),
+    attachments: attachment,
+    guid: String(guid)
+  };
+}
+
+function vkApiRequest(method, fields) {
+  return {
+    url: API_BASE + method,
+    body: buildFormBody(fields)
+  };
 }
 
 function sniffImage(bytes) {
@@ -180,40 +181,167 @@ function sniffImage(bytes) {
   return null;
 }
 
-function attachmentFromPhoto(photo, groupId) {
-  if (!photo || photo.id == null || photo.owner_id == null) {
-    throw vkError('attachment', humanize('attachment'), 'upload', false);
+function readImageSize(bytes) {
+  const data = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes || []);
+  const kind = sniffImage(data);
+  if (!kind) return null;
+  if (kind.mime === 'image/png') {
+    if (data.length < 24) return null;
+    return { width: data.readUInt32BE(16), height: data.readUInt32BE(20), mime: kind.mime, filename: kind.filename };
   }
-  const ownerId = Number(photo.owner_id);
-  const expected = -Math.abs(Number(groupId));
-  if (!Number.isFinite(ownerId) || ownerId !== expected) {
-    throw vkError('attachment_owner', humanize('attachment_owner'), 'upload', false);
+  if (kind.mime === 'image/gif') {
+    if (data.length < 10) return null;
+    return { width: data.readUInt16LE(6), height: data.readUInt16LE(8), mime: kind.mime, filename: kind.filename };
   }
-  return 'photo' + ownerId + '_' + photo.id;
+  let offset = 2;
+  while (offset + 9 < data.length) {
+    if (data[offset] !== 0xff) return null;
+    const marker = data[offset + 1];
+    if (marker === 0xd8 || marker === 0xd9) {
+      offset += 2;
+      continue;
+    }
+    if (offset + 4 > data.length) return null;
+    const length = data.readUInt16BE(offset + 2);
+    if (length < 2 || offset + 2 + length > data.length) return null;
+    const isSof = (marker >= 0xc0 && marker <= 0xc3)
+      || (marker >= 0xc5 && marker <= 0xc7)
+      || (marker >= 0xc9 && marker <= 0xcb)
+      || (marker >= 0xcd && marker <= 0xcf);
+    if (isSof) {
+      return {
+        width: data.readUInt16BE(offset + 7),
+        height: data.readUInt16BE(offset + 5),
+        mime: kind.mime,
+        filename: kind.filename
+      };
+    }
+    offset += 2 + length;
+  }
+  return null;
 }
 
-function buildWallPostParams({ groupId, message, attachment, guid }) {
+function imageLimitError(bytes) {
+  if (!bytes || !bytes.length) return 'Изображение пустое.';
+  if (bytes.length > MAX_IMAGE_BYTES) return 'Изображение больше 20 МБ. Черновик с таким файлом не сохраняется.';
+  const size = readImageSize(bytes);
+  if (!size || !size.width || !size.height) return 'Не удалось прочитать размер JPG, PNG или GIF.';
+  if (size.width + size.height > 14000) return 'Сумма сторон изображения больше 14 000 пикселей.';
+  const ratio = Math.max(size.width, size.height) / Math.min(size.width, size.height);
+  if (ratio > 20) return 'Соотношение сторон хуже 1:20. ВКонтакте такое фото на стену не принимает.';
+  return null;
+}
+
+function inspectImage(bytes, filename) {
+  const data = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes || []);
+  const problem = imageLimitError(data);
+  if (problem) return { ok: false, errors: [problem] };
+  const size = readImageSize(data);
   return {
-    owner_id: -Math.abs(Number(groupId)),
-    from_group: 1,
-    signed: 0,
-    message: String(message),
-    attachments: attachment,
-    guid: String(guid)
+    ok: true,
+    errors: [],
+    image: {
+      filename: filename || size.filename,
+      mime: size.mime,
+      base64: data.toString('base64'),
+      byte_length: data.length,
+      width: size.width,
+      height: size.height,
+      sha256: fnvHex(data)
+    },
+    bytes: data
   };
 }
 
-function normalizeGroupId(groupId) {
-  const value = String(groupId || '').trim().replace(/^-/, '');
-  if (!/^[1-9]\d*$/.test(value)) return null;
-  return value;
+function attachDraftImage(pkg, bytes, filename) {
+  ensurePublication(pkg);
+  const inspected = inspectImage(bytes, filename);
+  if (!inspected.ok) {
+    pkg.visual.image = null;
+    return inspected;
+  }
+  pkg.visual.image = inspected.image;
+  return inspected;
 }
 
-function extractPosts(response) {
-  if (Array.isArray(response)) return response;
-  if (response && Array.isArray(response.items)) return response.items;
-  if (response && Array.isArray(response.posts)) return response.posts;
-  return [];
+function readDraftImage(pkg) {
+  const image = pkg && pkg.visual && pkg.visual.image;
+  if (!image || !image.base64) return null;
+  const bytes = Buffer.from(String(image.base64), 'base64');
+  const inspected = inspectImage(bytes, image.filename);
+  if (!inspected.ok) return null;
+  return inspected;
+}
+
+function validateModelPackage(data) {
+  const errors = [];
+  if (!data || typeof data !== 'object') {
+    return { ok: false, errors: ['Ответ модели не является объектом JSON.'], lengths: {} };
+  }
+  if (!data.analysis || typeof data.analysis !== 'object' || Array.isArray(data.analysis)) {
+    errors.push('В пакете нет объекта analysis.');
+  }
+  if (!data.image_prompt || typeof data.image_prompt !== 'string' || !data.image_prompt.trim()) {
+    errors.push('В пакете нет image_prompt.');
+  }
+  const lengths = {};
+  for (const name of Object.keys(LIMITS)) {
+    const content = data.platforms && data.platforms[name] && data.platforms[name].content;
+    if (typeof content !== 'string' || !content.trim()) {
+      errors.push('В пакете нет текста платформы ' + name + '.');
+      lengths[name] = 0;
+      continue;
+    }
+    lengths[name] = content.length;
+    const rule = LIMITS[name];
+    if (content.length < rule.min || content.length > rule.max) {
+      errors.push('Текст ' + name + ' имеет длину ' + content.length + '. Допустимо ' + rule.min + '–' + rule.max + ' символов.');
+    }
+  }
+  return { ok: errors.length === 0, errors, lengths };
+}
+
+function validatePublishableVk(pkg, groupId) {
+  ensurePublication(pkg);
+  const errors = [];
+  const text = String(pkg.platforms && pkg.platforms.vk && pkg.platforms.vk.content || '').trim();
+  if (text.length < LIMITS.vk.min || text.length > LIMITS.vk.max) {
+    errors.push(humanize('text_missing') + ' Сейчас ' + text.length + ' символов.');
+  }
+  const image = readDraftImage(pkg);
+  if (!image) errors.push(humanize('image_missing'));
+  if (!normalizeGroupId(groupId)) errors.push(humanize('config'));
+  return { ok: errors.length === 0, errors, text, image };
+}
+
+function ownsLock(pkg, lockToken) {
+  const vk = pkg.publication && pkg.publication.vk;
+  return Boolean(lockToken && vk && vk.lock_token === lockToken);
+}
+
+function clearLock(vk) {
+  vk.lock_token = null;
+  vk.locked_at = null;
+}
+
+function failKnown(pkg, code) {
+  const vk = pkg.publication.vk;
+  vk.status = 'failed';
+  vk.retryable = true;
+  vk.error_code = String(code);
+  vk.error_message = humanize(code);
+  clearLock(vk);
+  return Object.assign(resultOf(pkg, 'failed'), { ready: false });
+}
+
+function markUncertain(pkg, code, message) {
+  const vk = pkg.publication.vk;
+  vk.status = 'uncertain';
+  vk.retryable = false;
+  vk.error_code = String(code || 'timeout');
+  vk.error_message = message || humanize('timeout');
+  clearLock(vk);
+  return Object.assign(resultOf(pkg, 'uncertain'), { ready: false });
 }
 
 function markPublished(pkg, groupId, postId, now) {
@@ -226,121 +354,43 @@ function markPublished(pkg, groupId, postId, now) {
   vk.retryable = false;
   vk.error_code = null;
   vk.error_message = null;
-  vk.locked_at = null;
+  clearLock(vk);
   pkg.status = 'published';
-  return resultOf(pkg, 'published');
+  return Object.assign(resultOf(pkg, 'published'), { ready: false });
 }
 
-function resultOf(pkg, action) {
-  const vk = pkg.publication.vk || emptyVkPublication();
-  return {
-    action,
-    status: vk.status,
-    post_id: vk.post_id,
-    url: vk.url,
-    attachment: vk.attachment,
-    error_code: vk.error_code,
-    error_message: vk.error_message,
-    retryable: vk.retryable
-  };
-}
-
-function applyFailure(pkg, error, secrets) {
-  const vk = pkg.publication.vk;
-  const phase = error.phase || (vk.status === 'publishing' ? 'publish' : 'upload');
-  const uncertain = Boolean(error.uncertain) || (vk.status === 'publishing' && (error.code === 'timeout' || error.code === 'network' || error.code === 1 || error.code === 10));
-  const message = redact(humanize(error.code, error.message, phase), secrets);
-  if (uncertain) {
-    vk.status = 'uncertain';
-    vk.retryable = false;
-    vk.error_code = String(error.code || 'uncertain');
-    vk.error_message = message;
-    vk.locked_at = null;
-    return resultOf(pkg, 'uncertain');
-  }
-  vk.status = 'failed';
-  vk.retryable = true;
-  vk.error_code = String(error.code || 'failed');
-  vk.error_message = message;
-  vk.locked_at = null;
-  if (pkg.publication.telegram.status === 'published' && pkg.status === 'publishing') {
-    pkg.status = 'publishing';
-  }
-  return resultOf(pkg, 'failed');
-}
-
-async function findMatchingPost(client, credentials, text) {
-  const response = await client.call('wall.get', {
-    owner_id: -Math.abs(Number(credentials.groupId)),
-    count: 20,
-    filter: 'owner'
-  }, { token: credentials.communityToken, phase: 'reconcile' });
-  const posts = extractPosts(response);
-  const wanted = String(text || '').trim();
-  return posts.filter((post) => String(post.text || post.message || '').trim() === wanted);
-}
-
-async function confirmPostId(client, credentials, postId) {
-  const groupId = normalizeGroupId(credentials.groupId);
-  const response = await client.call('wall.getById', {
-    posts: '-' + groupId + '_' + postId
-  }, { token: credentials.communityToken, phase: 'reconcile' });
-  const posts = extractPosts(response);
-  return posts.find((post) => Number(post.id) === Number(postId)) || null;
+function lostLock(pkg) {
+  return Object.assign(resultOf(pkg, 'lock_lost'), {
+    ready: false,
+    error_message: humanize('lock_lost')
+  });
 }
 
 function prepareApproval({ pkg, chatId, userId, now, footer }) {
   ensurePublication(pkg);
-  if (String(pkg.source?.chat_id) !== String(chatId)) {
+  if (String(pkg.source && pkg.source.chat_id) !== String(chatId)) {
     return { ok: false, message: 'Этот черновик создан в другом чате.' };
   }
-  if (pkg.status === 'rejected' || pkg.approval?.decision === 'rejected') {
+  if (pkg.status === 'rejected' || (pkg.approval && pkg.approval.decision === 'rejected')) {
     return { ok: false, message: 'Черновик отклонён и не будет опубликован.' };
   }
-
   const vk = pkg.publication.vk;
   const tg = pkg.publication.telegram;
   const stamp = now || new Date().toISOString();
-
   if (vk.status === 'published' && vk.post_id) {
-    return {
-      ok: false,
-      message: 'Черновик уже опубликован во ВКонтакте.\n' + vk.url
-    };
+    return { ok: false, message: 'Черновик уже опубликован во ВКонтакте.\n' + vk.url };
   }
-
-  if ((vk.status === 'uploading' || vk.status === 'publishing') && isFresh(vk.locked_at, stamp)) {
+  if (IN_FLIGHT.has(vk.status) && isFresh(vk.locked_at, stamp)) {
     return { ok: false, message: 'Публикация во ВКонтакте уже выполняется. Второй пост не создан.' };
   }
-
-  if (vk.status === 'uploading' || vk.status === 'publishing') {
-    vk.status = 'uncertain';
-    vk.retryable = false;
-    vk.error_code = 'stale_lock';
-    vk.error_message = 'Предыдущий запрос публикации не завершился. Новый пост не отправлен.';
-    vk.locked_at = null;
-  }
-
-  if (vk.status === 'uncertain') {
-    return {
-      ok: true,
-      publishTelegram: false,
-      mode: 'reconcile_only',
-      publishChatId: tg.chat_id,
-      publishText: telegramText(pkg, footer)
-    };
-  }
-
   if (tg.status === 'publishing' && isFresh(tg.locked_at, stamp)) {
     return { ok: false, message: 'Публикация в Telegram уже выполняется. Повтор не создан.' };
   }
-
   const publishTelegram = tg.status !== 'published';
   if (publishTelegram) {
     tg.status = 'publishing';
     tg.locked_at = stamp;
   }
-
   if (pkg.status === 'review_required' || !pkg.approval || pkg.approval.decision === 'pending') {
     pkg.status = 'publishing';
     pkg.approval = {
@@ -349,27 +399,27 @@ function prepareApproval({ pkg, chatId, userId, now, footer }) {
       decided_at: stamp
     };
   }
-
+  let mode = 'publish';
+  if (vk.status === 'uncertain' || vk.status === 'publishing') mode = 'reconcile';
   return {
     ok: true,
     publishTelegram,
-    mode: 'publish',
+    mode,
     publishChatId: tg.chat_id,
     publishText: telegramText(pkg, footer)
   };
 }
 
 function applyReject({ pkg, chatId, userId, now }) {
-  if (!pkg) {
-    return { rejected: false, message: 'Черновик не найден. Укажите ID: /reject ID' };
-  }
+  if (!pkg) return { rejected: false, message: 'Черновик не найден. Укажите ID: /reject ID' };
   ensurePublication(pkg);
-  if (String(pkg.source?.chat_id) !== String(chatId)) {
+  if (String(pkg.source && pkg.source.chat_id) !== String(chatId)) {
     return { rejected: false, message: 'Этот черновик создан в другом чате.' };
   }
-  if (pkg.status !== 'review_required' || pkg.approval?.decision !== 'pending') {
+  if (pkg.status !== 'review_required' || !pkg.approval || pkg.approval.decision !== 'pending') {
     return {
       rejected: false,
+      publish: false,
       message: 'Черновик ' + (pkg.request_id || '') + ' уже обработан. Статус: ' + pkg.status
     };
   }
@@ -386,455 +436,286 @@ function applyReject({ pkg, chatId, userId, now }) {
   };
 }
 
-async function loadDraftImage(pkg, loadImage) {
-  const loader = loadImage || defaultLoadImage;
-  const image = await loader(pkg);
-  if (!image || !image.bytes || !image.bytes.length) {
-    throw vkError('image_missing', humanize('image_missing'), 'upload', false);
-  }
-  const bytes = Buffer.isBuffer(image.bytes) ? image.bytes : Buffer.from(image.bytes);
-  if (bytes.length > MAX_IMAGE_BYTES) {
-    throw vkError('image_missing', 'Изображение больше 50 МБ. Запись на стену не создавалась.', 'upload', false);
-  }
-  const sniffed = sniffImage(bytes);
-  if (!sniffed) {
-    throw vkError('image_missing', 'Файл изображения не JPG, PNG или GIF. Запись на стену не создавалась.', 'upload', false);
-  }
-  return {
-    bytes,
-    mime: sniffed.mime,
-    filename: image.filename || sniffed.filename
-  };
-}
-
-async function defaultLoadImage(pkg) {
-  const image = pkg.visual && pkg.visual.image;
-  if (!image) throw vkError('image_missing', humanize('image_missing'), 'upload', false);
-  if (image.base64) {
-    return {
-      bytes: Buffer.from(String(image.base64), 'base64'),
-      filename: image.filename
-    };
-  }
-  if (image.bytes) return image;
-  if (image.path) {
-    const fs = require('fs');
-    return {
-      bytes: fs.readFileSync(image.path),
-      filename: image.filename || 'photo.jpg'
-    };
-  }
-  throw vkError('image_missing', humanize('image_missing'), 'upload', false);
-}
-
-function readCredentials(credentials) {
-  const groupId = normalizeGroupId(credentials && credentials.groupId);
-  const communityToken = String(credentials && credentials.communityToken || '').trim();
-  const userToken = String(credentials && credentials.userToken || '').trim();
-  if (!groupId) {
-    throw vkError('config', 'Не задан числовой идентификатор сообщества KNIGHTCAT_VK_GROUP_ID.', 'config', false);
-  }
-  if (!communityToken) {
-    throw vkError('config', 'Не задан ключ доступа сообщества. Он нужен, чтобы опубликовать запись от имени сообщества.', 'config', false);
-  }
-  if (!userToken) {
-    throw vkError('config', 'Не задан пользовательский ключ с правом photos. Ключ сообщества не загружает фото на стену.', 'config', false);
-  }
-  return { groupId, communityToken, userToken };
-}
-
-async function reconcilePublication({ pkg, credentials, client, now }) {
+function claimPublication(pkg, options) {
+  const opts = options || {};
+  const now = opts.now || new Date().toISOString();
   ensurePublication(pkg);
   const vk = pkg.publication.vk;
-  const secrets = [credentials && credentials.communityToken, credentials && credentials.userToken];
-  const stamp = now || new Date().toISOString();
-  if (vk.status === 'published' && vk.post_id) return resultOf(pkg, 'already_published');
-  if (pkg.status === 'rejected' || pkg.approval?.decision === 'rejected') {
-    return resultOf(pkg, 'rejected');
+  if (pkg.status === 'rejected' || (pkg.approval && pkg.approval.decision === 'rejected')) {
+    return Object.assign(resultOf(pkg, 'rejected'), { ready: false, message: 'Черновик отклонён и не будет опубликован.' });
   }
-  try {
-    const creds = readCredentials(credentials);
-    if (vk.post_id) {
-      const confirmed = await confirmPostId(client, creds, vk.post_id);
-      if (confirmed) return markPublished(pkg, creds.groupId, vk.post_id, stamp);
-    }
-    const matches = await findMatchingPost(client, creds, pkg.platforms?.vk?.content);
-    if (matches.length === 1 && matches[0].id != null) {
-      return markPublished(pkg, creds.groupId, matches[0].id, stamp);
-    }
-    if (matches.length > 1) {
-      vk.status = 'uncertain';
-      vk.retryable = false;
-      vk.error_code = 'ambiguous';
-      vk.error_message = 'На стене несколько записей с тем же текстом. Укажите post_id командой /vk-resolve.';
-      return Object.assign(resultOf(pkg, 'uncertain'), { search_completed: true, match_count: matches.length });
-    }
-    vk.status = 'uncertain';
-    vk.retryable = false;
-    vk.error_code = 'not_found';
-    vk.error_message = 'Сверка не нашла запись. Новый пост не создан. Если на стене пусто, отправьте /vk-resolve ' + pkg.request_id + ' absent.';
-    return Object.assign(resultOf(pkg, 'uncertain'), { search_completed: true, match_count: 0 });
-  } catch (error) {
-    if (vk.status === 'uncertain' || vk.status === 'publishing' || vk.status === 'uploading') {
-      vk.status = 'uncertain';
-      vk.retryable = false;
-      vk.error_code = String(error.code || 'reconcile_failed');
-      vk.error_message = 'Сверка не выполнена. Новый пост не создан.';
-      vk.locked_at = null;
-      return Object.assign(resultOf(pkg, 'uncertain'), { search_completed: false, match_count: null });
-    }
-    return applyFailure(pkg, error.phase ? error : classifyTransportError(error, 'reconcile'), secrets);
+  if (vk.status === 'published' && vk.post_id) {
+    return Object.assign(resultOf(pkg, 'already_published'), { ready: false, message: 'Черновик уже опубликован во ВКонтакте.\n' + vk.url });
   }
-}
-
-async function publishApprovedDraft({ pkg, credentials, client, now, loadImage, mode }) {
-  ensurePublication(pkg);
-  const vk = pkg.publication.vk;
-  const secrets = [credentials && credentials.communityToken, credentials && credentials.userToken];
-  const stamp = now || new Date().toISOString();
-
-  if (pkg.status === 'rejected' || pkg.approval?.decision === 'rejected') {
-    return resultOf(pkg, 'rejected');
+  if (vk.status === 'uncertain') {
+    return Object.assign(resultOf(pkg, 'reconcile'), { message: vk.error_message || humanize('timeout') });
   }
-  if (vk.status === 'published' && vk.post_id) return resultOf(pkg, 'already_published');
-  if ((vk.status === 'uploading' || vk.status === 'publishing') && isFresh(vk.locked_at, stamp)) {
-    return resultOf(pkg, 'in_progress');
+  if (IN_FLIGHT.has(vk.status) && isFresh(vk.locked_at, now)) {
+    return Object.assign(resultOf(pkg, 'in_progress'), {
+      ready: false,
+      message: 'Публикация во ВКонтакте уже выполняется. Второй пост не создан.'
+    });
   }
-  if (vk.status === 'uncertain' || mode === 'reconcile_only') {
-    return reconcilePublication({ pkg, credentials, client, now: stamp });
+  if (vk.status === 'publishing') {
+    markUncertain(pkg, 'stale_lock', 'Предыдущий запрос публикации не завершился. Новый пост не отправлен. Нужна сверка, а не повтор.');
+    return Object.assign(resultOf(pkg, 'reconcile'), {
+      message: pkg.publication.vk.error_message
+    });
   }
-  if ((vk.status === 'uploading' || vk.status === 'publishing') && !isFresh(vk.locked_at, stamp)) {
-    vk.status = 'uncertain';
-    vk.retryable = false;
-    vk.error_code = 'stale_lock';
-    vk.error_message = humanize('timeout');
-    return reconcilePublication({ pkg, credentials, client, now: stamp });
-  }
-
-  vk.status = 'uploading';
-  vk.locked_at = stamp;
+  vk.lock_seq = Number(vk.lock_seq || 0) + 1;
+  vk.lock_token = opts.lockToken || ('lk' + fnvHex(String(pkg.request_id) + '\n' + now + '\n' + vk.lock_seq));
+  vk.locked_at = now;
+  vk.status = 'locked';
+  vk.retryable = false;
   vk.error_code = null;
   vk.error_message = null;
-
-  try {
-    const text = String(pkg.platforms?.vk?.content || '').trim();
-    if (!text) throw vkError('text_missing', humanize('text_missing'), 'upload', false);
-    const image = await loadDraftImage(pkg, loadImage);
-    const creds = readCredentials(credentials);
-    const contentSha = fnvHex(text + '\n' + fnvHex(image.bytes));
-    vk.content_sha256 = contentSha;
-    vk.guid = vk.guid || makeGuid(pkg.request_id, contentSha);
-
-    const server = await client.call('photos.getWallUploadServer', {
-      group_id: creds.groupId
-    }, { token: creds.userToken, phase: 'upload' });
-    if (!server || !server.upload_url) {
-      throw vkError('upload_host', 'ВКонтакте не вернул адрес загрузки изображения.', 'upload', false);
-    }
-    assertUploadHost(server.upload_url);
-    const uploaded = await client.upload(server.upload_url, image, { phase: 'upload' });
-    if (!uploaded || uploaded.error || uploaded.server == null || !uploaded.photo || !uploaded.hash) {
-      throw vkError('22', humanize(22), 'upload', false);
-    }
-    const saved = await client.call('photos.saveWallPhoto', {
-      group_id: creds.groupId,
-      server: uploaded.server,
-      photo: uploaded.photo,
-      hash: uploaded.hash
-    }, { token: creds.userToken, phase: 'upload' });
-    const photo = Array.isArray(saved) ? saved[0] : saved;
-    vk.attachment = attachmentFromPhoto(photo, creds.groupId);
-
-    vk.status = 'publishing';
-    vk.locked_at = new Date(Date.parse(stamp) + 1).toISOString();
-    const params = buildWallPostParams({
-      groupId: creds.groupId,
-      message: text,
-      attachment: vk.attachment,
-      guid: vk.guid
-    });
-    let posted;
-    try {
-      posted = await client.call('wall.post', params, { token: creds.communityToken, phase: 'publish' });
-    } catch (error) {
-      const interpreted = error.phase ? error : classifyTransportError(error, 'publish');
-      if (interpreted.uncertain) {
-        vk.status = 'uncertain';
-        vk.retryable = false;
-        vk.error_code = String(interpreted.code);
-        vk.error_message = redact(humanize(interpreted.code, interpreted.message, 'publish'), secrets);
-        vk.locked_at = null;
-        try {
-          const matches = await findMatchingPost(client, creds, text);
-          if (matches.length === 1 && matches[0].id != null) {
-            return markPublished(pkg, creds.groupId, matches[0].id, stamp);
-          }
-          if (matches.length > 1) {
-            vk.error_code = 'ambiguous';
-            vk.error_message = 'На стене несколько записей с тем же текстом. Укажите post_id командой /vk-resolve.';
-          }
-        } catch (reconcileError) {
-          vk.error_message = redact(humanize(interpreted.code, interpreted.message, 'publish'), secrets);
-        }
-        return resultOf(pkg, 'uncertain');
-      }
-      try {
-        const matches = await findMatchingPost(client, creds, text);
-        if (matches.length === 1 && matches[0].id != null) {
-          return markPublished(pkg, creds.groupId, matches[0].id, stamp);
-        }
-      } catch (reconcileError) {
-        // Сверка не удалась. Ниже сохранится исходная ошибка публикации, без нового wall.post.
-      }
-      throw interpreted;
-    }
-    if (!posted || posted.post_id == null) {
-      throw vkError('publish_response', 'ВКонтакте не вернул post_id.', 'publish', true);
-    }
-    return markPublished(pkg, creds.groupId, posted.post_id, stamp);
-  } catch (error) {
-    const interpreted = error && error.phase ? error : classifyTransportError(error, vk.status === 'publishing' ? 'publish' : 'upload');
-    return applyFailure(pkg, interpreted, secrets);
-  }
+  return Object.assign(resultOf(pkg, 'publish'), { message: null });
 }
 
-async function resolveUncertain({ pkg, argument, credentials, client, now }) {
+function prepareGetUploadServer(pkg, options) {
+  const opts = options || {};
+  ensurePublication(pkg);
+  if (!ownsLock(pkg, opts.lockToken)) return lostLock(pkg);
+  const vk = pkg.publication.vk;
+  if (vk.status === 'uncertain' || vk.status === 'publishing' || vk.status === 'published') {
+    return Object.assign(resultOf(pkg, vk.status === 'published' ? 'already_published' : 'uncertain'), { ready: false });
+  }
+  const check = validatePublishableVk(pkg, opts.groupId);
+  if (!check.ok) {
+    vk.status = 'failed';
+    vk.retryable = true;
+    vk.error_code = 'validation';
+    vk.error_message = check.errors.join(' ');
+    clearLock(vk);
+    return Object.assign(resultOf(pkg, 'failed'), { ready: false });
+  }
+  const contentSha = fnvHex(check.text + '\n' + check.image.image.sha256);
+  vk.content_sha256 = contentSha;
+  vk.guid = makeGuid(pkg.request_id, contentSha);
+  vk.status = 'uploading';
+  vk.locked_at = opts.now || new Date().toISOString();
+  const request = vkApiRequest('photos.getWallUploadServer', { group_id: normalizeGroupId(opts.groupId) });
+  return Object.assign(resultOf(pkg, 'publish'), {
+    ready: true,
+    vk_request_url: request.url,
+    vk_request_body: request.body
+  });
+}
+
+function envelopeError(body) {
+  if (!body || typeof body !== 'object') return { code: 'empty' };
+  if (body.error && body.error.error_code) return { code: body.error.error_code, message: body.error.error_msg || '' };
+  return null;
+}
+
+function acceptUploadServer(pkg, options) {
+  const opts = options || {};
+  ensurePublication(pkg);
+  if (!ownsLock(pkg, opts.lockToken)) return lostLock(pkg);
+  const apiError = envelopeError(opts.body);
+  if (apiError) return failKnown(pkg, apiError.code);
+  const response = opts.body && opts.body.response;
+  if (!response || !response.upload_url) return failKnown(pkg, 'upload_host');
+  let parsed;
+  try {
+    parsed = new URL(String(response.upload_url));
+  } catch (error) {
+    return failKnown(pkg, 'upload_host');
+  }
+  const host = parsed.hostname.toLowerCase();
+  const allowed = parsed.protocol === 'https:' && (
+    host === 'vk.ru' || host === 'vk.com' || host.endsWith('.vk.ru') || host.endsWith('.vk.com') || host.endsWith('.userapi.com')
+  );
+  if (!allowed) return failKnown(pkg, 'upload_host');
+  return Object.assign(resultOf(pkg, 'publish'), { ready: true, vk_upload_url: response.upload_url });
+}
+
+function acceptPhotoUpload(pkg, options) {
+  const opts = options || {};
+  ensurePublication(pkg);
+  if (!ownsLock(pkg, opts.lockToken)) return lostLock(pkg);
+  const body = opts.body || {};
+  if (body.error) return failKnown(pkg, body.error.error_code || 22);
+  if (body.server == null || !body.photo || !body.hash) return failKnown(pkg, 22);
+  const request = vkApiRequest('photos.saveWallPhoto', {
+    group_id: normalizeGroupId(opts.groupId),
+    server: body.server,
+    photo: body.photo,
+    hash: body.hash
+  });
+  return Object.assign(resultOf(pkg, 'publish'), {
+    ready: true,
+    vk_request_url: request.url,
+    vk_request_body: request.body
+  });
+}
+
+function attachmentFromPhoto(photo, groupId) {
+  if (!photo || photo.id == null || photo.owner_id == null) return { ok: false, code: 'attachment' };
+  const ownerId = Number(photo.owner_id);
+  const expected = -Math.abs(Number(groupId));
+  if (!Number.isFinite(ownerId) || ownerId !== expected) return { ok: false, code: 'attachment_owner' };
+  return { ok: true, attachment: 'photo' + ownerId + '_' + photo.id };
+}
+
+function acceptSavedPhoto(pkg, options) {
+  const opts = options || {};
+  const now = opts.now || new Date().toISOString();
+  ensurePublication(pkg);
+  if (!ownsLock(pkg, opts.lockToken)) return lostLock(pkg);
+  const apiError = envelopeError(opts.body);
+  if (apiError) return failKnown(pkg, apiError.code);
+  const response = opts.body && opts.body.response;
+  const photo = Array.isArray(response) ? response[0] : response;
+  const attachment = attachmentFromPhoto(photo, opts.groupId);
+  if (!attachment.ok) return failKnown(pkg, attachment.code);
+  const vk = pkg.publication.vk;
+  vk.attachment = attachment.attachment;
+  vk.status = 'publishing';
+  vk.locked_at = now;
+  const text = String(pkg.platforms.vk.content || '').trim();
+  const request = vkApiRequest('wall.post', buildWallPostParams(
+    normalizeGroupId(opts.groupId),
+    text,
+    vk.attachment,
+    vk.guid
+  ));
+  return Object.assign(resultOf(pkg, 'publish'), {
+    ready: true,
+    vk_request_url: request.url,
+    vk_request_body: request.body
+  });
+}
+
+function acceptWallPost(pkg, options) {
+  const opts = options || {};
+  const now = opts.now || new Date().toISOString();
+  ensurePublication(pkg);
+  if (!ownsLock(pkg, opts.lockToken)) return lostLock(pkg);
+  const apiError = envelopeError(opts.body);
+  if (apiError) {
+    if (Number(apiError.code) === 1 || Number(apiError.code) === 10) {
+      return markUncertain(pkg, apiError.code, humanize('timeout'));
+    }
+    return failKnown(pkg, apiError.code);
+  }
+  const response = opts.body && opts.body.response;
+  if (!response || response.post_id == null) return markUncertain(pkg, 'publish_response', humanize('timeout'));
+  return markPublished(pkg, opts.groupId, response.post_id, now);
+}
+
+function markPublishUnknown(pkg, options) {
+  const opts = options || {};
+  ensurePublication(pkg);
+  if (!ownsLock(pkg, opts.lockToken)) return lostLock(pkg);
+  const code = opts.body && opts.body.error && opts.body.error.error_code;
+  if (code && KNOWN_REJECT_CODES.has(Number(code))) return failKnown(pkg, Number(code));
+  return markUncertain(pkg, code || 'timeout', humanize('timeout') + ' Просмотр последних 20 записей это не подтверждает и не опровергает.');
+}
+
+function recordUploadFailure(pkg, options) {
+  const opts = options || {};
+  ensurePublication(pkg);
+  if (!ownsLock(pkg, opts.lockToken)) return lostLock(pkg);
+  if (pkg.publication.vk.status === 'publishing') return markPublishUnknown(pkg, opts);
+  const code = opts.body && opts.body.error && (opts.body.error.error_code || opts.body.error.code);
+  return failKnown(pkg, code || 22);
+}
+
+function buildReconcileRequest(pkg, options) {
+  const opts = options || {};
+  ensurePublication(pkg);
+  const groupId = normalizeGroupId(opts.groupId);
+  if (!groupId) {
+    return Object.assign(resultOf(pkg, 'failed'), { ready: false, error_message: humanize('config') });
+  }
+  const postId = String(opts.postId || pkg.publication.vk.post_id || '').trim();
+  if (/^[1-9]\d*$/.test(postId)) {
+    const request = vkApiRequest('wall.getById', { posts: '-' + groupId + '_' + postId });
+    return Object.assign(resultOf(pkg, 'reconcile'), {
+      ready: true,
+      scope: 'by_id',
+      vk_request_url: request.url,
+      vk_request_body: request.body
+    });
+  }
+  const request = vkApiRequest('wall.get', {
+    owner_id: -Number(groupId),
+    count: RECENT_SCAN_LIMIT,
+    filter: 'owner'
+  });
+  return Object.assign(resultOf(pkg, 'reconcile'), {
+    ready: true,
+    scope: 'recent',
+    vk_request_url: request.url,
+    vk_request_body: request.body
+  });
+}
+
+function extractPosts(body) {
+  const response = body && body.response ? body.response : body;
+  if (Array.isArray(response)) return response;
+  if (response && Array.isArray(response.items)) return response.items;
+  if (response && Array.isArray(response.posts)) return response.posts;
+  return [];
+}
+
+function applyReconcileResult(pkg, options) {
+  const opts = options || {};
+  const now = opts.now || new Date().toISOString();
   ensurePublication(pkg);
   const vk = pkg.publication.vk;
-  const stamp = now || new Date().toISOString();
-  if (pkg.status === 'rejected' || pkg.approval?.decision === 'rejected') {
-    return resultOf(pkg, 'rejected');
-  }
   if (vk.status === 'published' && vk.post_id) return resultOf(pkg, 'already_published');
+  const apiError = envelopeError(opts.body);
+  if (apiError) {
+    return markUncertain(pkg, 'reconcile_failed', 'Сверка не выполнена. Новый пост не создан.');
+  }
+  const posts = extractPosts(opts.body);
+  const wanted = String(pkg.platforms && pkg.platforms.vk && pkg.platforms.vk.content || '').trim();
+  if (opts.scope === 'by_id') {
+    const confirmed = posts.find((post) => Number(post.id) === Number(opts.postId || vk.post_id));
+    if (confirmed && confirmed.id != null) return markPublished(pkg, opts.groupId, confirmed.id, now);
+    return markUncertain(
+      pkg,
+      'by_id_miss',
+      'Указанная запись на стене не найдена. Это не доказывает, что прежняя публикация не создалась. Новый пост не создан.'
+    );
+  }
+  const matches = posts.filter((post) => String(post.text || post.message || '').trim() === wanted && post.id != null);
+  if (matches.length === 1) return markPublished(pkg, opts.groupId, matches[0].id, now);
+  if (matches.length > 1) {
+    return markUncertain(pkg, 'ambiguous', 'В последних записях несколько постов с тем же текстом. Укажите post_id: /vk-resolve ID POST_ID.');
+  }
+  return markUncertain(pkg, 'scan_inconclusive', humanize('scan_inconclusive') + ' Если запись уже есть, пришлите её id: /vk-resolve ' + pkg.request_id + ' POST_ID.');
+}
+
+function planResolve(pkg, argument) {
+  ensurePublication(pkg);
+  const vk = pkg.publication.vk;
+  if (vk.status === 'published' && vk.post_id) {
+    return { action: 'stop', http: false, message: 'Запись уже сохранена.\n' + vk.url };
+  }
   if (vk.status !== 'uncertain') {
-    vk.error_message = 'Сверка доступна только когда исход публикации неизвестен. Сейчас статус: ' + vk.status;
-    return resultOf(pkg, vk.status === 'published' ? 'already_published' : 'failed');
+    return { action: 'stop', http: false, message: 'Сверка доступна, когда исход публикации неизвестен. Сейчас статус: ' + vk.status };
   }
   const decision = String(argument || '').trim().toLowerCase();
   if (decision === 'absent') {
-    const looked = await reconcilePublication({ pkg, credentials, client, now: stamp });
-    if (looked.action === 'published' || looked.action === 'already_published') return looked;
-    if (looked.error_code === 'ambiguous' || looked.search_completed !== true || looked.match_count !== 0) {
-      vk.status = 'uncertain';
-      vk.retryable = false;
-      if (!vk.error_message) {
-        vk.error_message = 'Нельзя разрешить повтор, пока сверка не подтвердила отсутствие записи.';
-      }
-      return resultOf(pkg, 'uncertain');
-    }
-    vk.status = 'failed';
-    vk.retryable = true;
-    vk.error_code = 'confirmed_absent';
-    vk.error_message = 'Запись на стене не найдена. Следующий /approve может опубликовать её один раз.';
-    return resultOf(pkg, 'failed');
+    return {
+      action: 'stop',
+      http: false,
+      message: 'Команда absent не снимает блокировку. Просмотр последних 20 записей не доказывает, что поста нет. Новый пост не будет создан. Если запись уже есть, укажите её id.'
+    };
   }
   if (/^[1-9]\d*$/.test(decision)) {
-    try {
-      const creds = readCredentials(credentials);
-      const confirmed = await confirmPostId(client, creds, decision);
-      if (!confirmed) {
-        vk.status = 'uncertain';
-        vk.error_code = 'not_found';
-        vk.error_message = 'Запись ' + decision + ' на стене сообщества не найдена. Статус остаётся неопределённым.';
-        return resultOf(pkg, 'uncertain');
-      }
-      return markPublished(pkg, creds.groupId, decision, stamp);
-    } catch (error) {
-      return applyFailure(pkg, error.phase ? error : classifyTransportError(error, 'reconcile'), [credentials.communityToken, credentials.userToken]);
-    }
+    return { action: 'reconcile', http: true, postId: decision, scope: 'by_id' };
   }
-  return reconcilePublication({ pkg, credentials, client, now: stamp });
+  return { action: 'reconcile', http: true, postId: null, scope: 'recent' };
 }
 
-function permissionNames(payload) {
-  const list = payload && (payload.permissions || payload.settings) || [];
-  if (!Array.isArray(list)) return [];
-  return list.map((item) => typeof item === 'string' ? item : item && item.name).filter(Boolean);
-}
-
-async function probeAccess({ client, communityToken, userToken }) {
-  const report = {
-    community: classifyTokenMaterial(communityToken),
-    user: classifyTokenMaterial(userToken)
-  };
-  if (communityToken) {
-    try {
-      const payload = await client.call('groups.getTokenPermissions', {}, {
-        token: communityToken,
-        phase: 'probe'
-      });
-      const names = permissionNames(payload);
-      report.community = {
-        present: true,
-        type: 'community',
-        permissions: names,
-        hasWall: names.includes('wall'),
-        hasPhotos: names.includes('photos')
-      };
-    } catch (error) {
-      report.community = {
-        present: true,
-        type: error.code === 5 ? 'invalid' : (error.code === 28 ? 'service' : 'unknown'),
-        error_code: error.code || null,
-        message: humanize(error.code, 'Ключ сообщества не подтвердился.', 'probe')
-      };
-    }
-  }
-  if (userToken) {
-    try {
-      const maskPayload = await client.call('account.getAppPermissions', {}, {
-        token: userToken,
-        phase: 'probe'
-      });
-      const mask = typeof maskPayload === 'number' ? maskPayload : Number(maskPayload && maskPayload.mask);
-      report.user = {
-        present: true,
-        type: 'user',
-        hasPhotos: (mask & 4) === 4,
-        hasWall: (mask & 8192) === 8192
-      };
-    } catch (error) {
-      let type = 'unknown';
-      if (error.code === 27) type = 'community_not_user';
-      else if (error.code === 28) type = 'service';
-      else if (error.code === 5) type = 'invalid';
-      report.user = {
-        present: true,
-        type,
-        error_code: error.code || null,
-        message: humanize(error.code, 'Пользовательский ключ не подтвердился.', 'probe')
-      };
-    }
-  }
-  return report;
-}
-
-function createN8nVkClient(helpers) {
-  if (!helpers || typeof helpers.httpRequest !== 'function') {
-    throw vkError('config', 'В узле n8n нет HTTP-клиента.', 'config', false);
-  }
-  return {
-    async call(method, params, options) {
-      const phase = options && options.phase || 'call';
-      const token = options && options.token;
-      const form = new URLSearchParams();
-      form.set('v', API_VERSION);
-      const source = params || {};
-      for (const key of Object.keys(source)) {
-        if (source[key] !== undefined && source[key] !== null && key !== 'access_token') {
-          form.set(key, String(source[key]));
-        }
-      }
-      let body;
-      try {
-        body = await helpers.httpRequest({
-          method: 'POST',
-          url: API_BASE + method,
-          headers: {
-            Authorization: 'Bearer ' + token,
-            'Content-Type': 'application/x-www-form-urlencoded'
-          },
-          body: form.toString(),
-          json: true,
-          timeout: 20000
-        });
-      } catch (error) {
-        throw classifyTransportError(error, phase);
-      }
-      const interpreted = interpretVkBody(body, phase);
-      if (interpreted) throw interpreted;
-      return body && Object.prototype.hasOwnProperty.call(body, 'response') ? body.response : body;
-    },
-    async upload(uploadUrl, image, options) {
-      const phase = options && options.phase || 'upload';
-      assertUploadHost(uploadUrl);
-      let body;
-      try {
-        body = await helpers.httpRequest({
-          method: 'POST',
-          url: uploadUrl,
-          formData: {
-            photo: {
-              value: image.bytes,
-              options: {
-                filename: image.filename || 'photo.jpg',
-                contentType: image.mime || 'image/jpeg'
-              }
-            }
-          },
-          json: true,
-          timeout: 30000
-        });
-      } catch (error) {
-        throw classifyTransportError(error, phase);
-      }
-      if (body && body.error) {
-        throw vkError(body.error.error_code || 22, body.error.error_msg || humanize(22), phase, false);
-      }
-      return body;
-    }
-  };
-}
-
-function createHttpClient({ fetchImpl, apiBase, version } = {}) {
-  const fetchFn = fetchImpl || globalThis.fetch;
-  const base = apiBase || API_BASE;
-  const apiVersion = version || API_VERSION;
-
-  async function call(method, params, options) {
-    const phase = options && options.phase || 'call';
-    const token = options && options.token;
-    const form = new URLSearchParams();
-    form.set('v', apiVersion);
-    const source = params || {};
-    for (const key of Object.keys(source)) {
-      if (source[key] !== undefined && source[key] !== null && key !== 'access_token') {
-        form.set(key, String(source[key]));
-      }
-    }
-    const url = base.replace(/\/$/, '') + '/' + method;
-    let response;
-    try {
-      response = await fetchFn(url, {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer ' + token,
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: form.toString()
-      });
-    } catch (error) {
-      throw classifyTransportError(error, phase);
-    }
-    if (!response.ok && response.status !== 200) {
-      throw classifyTransportError(new Error('HTTP ' + response.status), phase);
-    }
-    const body = await response.json();
-    const interpreted = interpretVkBody(body, phase);
-    if (interpreted) throw interpreted;
-    return body.response;
-  }
-
-  async function upload(uploadUrl, image, options) {
-    const phase = options && options.phase || 'upload';
-    assertUploadHost(uploadUrl);
-    const form = new FormData();
-    const blob = new Blob([image.bytes], { type: image.mime || 'image/jpeg' });
-    form.append('photo', blob, image.filename || 'photo.jpg');
-    let response;
-    try {
-      response = await fetchFn(uploadUrl, { method: 'POST', body: form });
-    } catch (error) {
-      throw classifyTransportError(error, phase);
-    }
-    const body = await response.json();
-    if (body && body.error) {
-      throw vkError(body.error.error_code || 22, body.error.error_msg || humanize(22), phase, false);
-    }
-    return body;
-  }
-
-  return { call, upload };
+function recordReconcileFailure(pkg) {
+  ensurePublication(pkg);
+  if (pkg.publication.vk.status === 'published') return resultOf(pkg, 'already_published');
+  return markUncertain(pkg, 'reconcile_failed', 'Сверка не выполнена. Новый пост не создан. Отсутствие записи не установлено.');
 }
 
 function formatPublicationMessage(pkg, telegramMessageId) {
@@ -850,41 +731,61 @@ function formatPublicationMessage(pkg, telegramMessageId) {
     lines.push(vk.url);
   } else if (vk.status === 'uncertain') {
     lines.push('ВКонтакте: исход неизвестен. Новый пост не создан.');
-    lines.push(vk.error_message || 'Нужна сверка.');
-    lines.push('/vk-resolve ' + pkg.request_id);
-    lines.push('/vk-resolve ' + pkg.request_id + ' absent');
+    lines.push(vk.error_message || humanize('timeout'));
+    lines.push('Если запись уже видна на стене: /vk-resolve ' + pkg.request_id + ' POST_ID');
   } else if (vk.status === 'failed') {
     lines.push('ВКонтакте не опубликовано. ' + (vk.error_message || 'Ошибка без подробностей.'));
-  } else if (vk.status === 'in_progress' || vk.status === 'uploading' || vk.status === 'publishing') {
+  } else if (IN_FLIGHT.has(vk.status)) {
     lines.push('ВКонтакте: публикация уже выполняется. Второй пост не создан.');
   }
   return lines.join('\n');
+}
+
+function largestPhotoFileId(photos) {
+  const list = Array.isArray(photos) ? photos.filter((item) => item && item.file_id) : [];
+  if (!list.length) return null;
+  const best = list.reduce((left, right) => ((right.file_size || 0) > (left.file_size || 0) ? right : left));
+  return String(best.file_id);
 }
 
 module.exports = {
   API_BASE,
   API_VERSION,
   LOCK_TTL_MS,
-  AUTH_CODES,
-  UPLOAD_CODES,
+  MAX_IMAGE_BYTES,
+  RECENT_SCAN_LIMIT,
+  LIMITS,
   emptyVkPublication,
   ensurePublication,
   makeGuid,
-  attachmentFromPhoto,
+  buildFormBody,
   buildWallPostParams,
+  vkApiRequest,
+  sniffImage,
+  readImageSize,
+  inspectImage,
+  attachDraftImage,
+  readDraftImage,
+  validateModelPackage,
+  validatePublishableVk,
   prepareApproval,
   applyReject,
-  publishApprovedDraft,
-  reconcilePublication,
-  resolveUncertain,
-  probeAccess,
-  createHttpClient,
-  createN8nVkClient,
-  interpretVkBody,
-  classifyTokenMaterial,
-  classifyTransportError,
+  claimPublication,
+  prepareGetUploadServer,
+  acceptUploadServer,
+  acceptPhotoUpload,
+  acceptSavedPhoto,
+  acceptWallPost,
+  markPublishUnknown,
+  recordUploadFailure,
+  buildReconcileRequest,
+  applyReconcileResult,
+  planResolve,
+  recordReconcileFailure,
   formatPublicationMessage,
-  sniffImage,
+  attachmentFromPhoto,
+  largestPhotoFileId,
+  humanize,
   normalizeGroupId,
-  humanize
+  ownsLock
 };

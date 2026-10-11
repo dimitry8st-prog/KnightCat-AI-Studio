@@ -129,6 +129,34 @@
       "guard": "no_blind_retry"
     },
     {
+      "id": "vk_recent_scan_empty",
+      "input": "wall.get из 20 записей не содержит текст черновика",
+      "execution": "local_stub",
+      "expected": [
+        "status_uncertain",
+        "scan_not_proof_of_absence"
+      ],
+      "guard": "no_wall_post"
+    },
+    {
+      "id": "vk_resolve_absent",
+      "input": "/vk-resolve REQUEST_ID absent",
+      "execution": "local_stub",
+      "expected": [
+        "lock_remains"
+      ],
+      "guard": "no_vk_api_call"
+    },
+    {
+      "id": "vk_package_limits",
+      "input": "Пакет модели с текстом VK короче 500 символов",
+      "execution": "local_stub",
+      "expected": [
+        "package_rejected"
+      ],
+      "guard": "no_draft_and_no_publication"
+    },
+    {
       "id": "invalid_model_json",
       "input": "Смоделированный ответ OpenRouter без корректного JSON",
       "expected": [
