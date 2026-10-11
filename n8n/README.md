@@ -49,7 +49,8 @@ Workflow по умолчанию выключен и не содержит се�
 - Confirm Publication;
 - Send Approval Error;
 - Confirm Rejection;
-- Send Help or Access Error.
+- Send Help or Access Error;
+- Download Draft Photo.
 
 Плейсхолдер `REPLACE_TELEGRAM_CREDENTIAL_ID` не является секретом и должен быть заменён выбором credential в интерфейсе n8n.
 
@@ -77,12 +78,17 @@ Workflow по умолчанию выключен и не содержит се�
 | `KNIGHTCAT_OPENROUTER_MODEL` | необязательно | `openai/gpt-4.1-mini` |
 | `KNIGHTCAT_FOOTER` | необязательно | `@your_channel` |
 | `KNIGHTCAT_VK_GROUP_ID` | для стены VK | числовой id сообщества, без знака `-` |
-| `KNIGHTCAT_VK_COMMUNITY_TOKEN` | для стены VK | ключ сообщества с правом `wall` |
-| `KNIGHTCAT_VK_USER_TOKEN` | для фото VK | пользовательский ключ с правом `photos` |
 
 Несколько разрешённых Telegram user ID указываются через запятую.
 
-Ключи ВКонтакте задаются только переменными n8n. В репозиторий и в текст ошибок они не попадают.
+Ключи ВКонтакте не являются переменными проекта. Их хранят только два n8n credential типа **Bearer Auth**:
+
+| Credential | Узлы | Плейсхолдер в файле |
+|---|---|---|
+| пользовательский ключ с правом `photos` | VK Get Upload Server, VK Save Wall Photo | `REPLACE_VK_USER_BEARER_ID` |
+| ключ сообщества с правом `wall` | VK Wall Post, VK Reconcile Wall | `REPLACE_VK_COMMUNITY_BEARER_ID` |
+
+Плейсхолдеры не являются секретами. Значение ключа выбирается в интерфейсе n8n и не записывается в JSON workflow, Git, README, query string, URL, execution dump и логи.
 
 Если `KNIGHTCAT_ALLOWED_USER_IDS` не задана, workflow никого не допускает. Если целевой чат не задан, публикация идёт в исходный чат — это удобно только для безопасного теста.
 
@@ -137,7 +143,7 @@ Workflow по умолчанию выключен и не содержит се�
 4. Вложение имеет вид `photo{owner_id}_{id}` и принимается только если `owner_id` равен `-GROUP_ID`.
 5. Параметр `guid` защищает от повтора около часа. Дольше этого контур держит состояние сам. Перед `wall.post` статус становится `publishing`. Узел `VK Wall Post` запрос не повторяет. Тайм-аут и пустой ответ оставляют `uncertain`: повторный approve только сверяет стену. Пустой список из 20 записей и команда `absent` не считаются доказательством отсутствия и новую публикацию не открывают. Подтверждают запись только одно точное совпадение текста среди этих 20 или найденный `wall.getById`.
 
-Проверка ключей без публикации: задать три переменные в окружении и запустить `node n8n/vk/probe-access.cjs`. Скрипт вызывает только `groups.getTokenPermissions` и `account.getAppPermissions`.
+Локальная проверка прав без публикации: `node n8n/vk/probe-access.cjs`. Скрипт читает `KNIGHTCAT_VK_GROUP_ID`, `KNIGHTCAT_VK_COMMUNITY_TOKEN` и `KNIGHTCAT_VK_USER_TOKEN` только из окружения процесса и не печатает их. Эти два ключа не нужно заводить переменными n8n: рабочий workflow берёт их из Bearer credentials. Если переменных окружения нет, скрипт не вызывает API. При наличии ключей он вызывает только `groups.getTokenPermissions` и `account.getAppPermissions`.
 
 Локальные проверки на заглушках: `node --test n8n/vk/vk-publisher.test.cjs`. Они не создают запись ВКонтакте.
 
@@ -150,7 +156,7 @@ Workflow по умолчанию выключен и не содержит се�
 3. В ручном режиме n8n static data может не сохраниться. Полный approval-тест проводится на активном workflow.
 4. Одновременное редактирование пакета не поддерживается.
 5. Используются текстовые команды вместо inline-кнопок — это уменьшает количество нестабильных деталей в первом вертикальном срезе.
-6. Реальные Telegram и VK в репозитории не вызывались: ключей в окружении нет. Проверка VK на заглушках лежит в `n8n/vk/vk-publisher.test.cjs`.
+6. Проверка VK на заглушках лежит в `n8n/vk/vk-publisher.test.cjs` и не вызывает ВКонтакте. GitHub Actions запускает тот же файл.
 
 ## Условия перехода к следующему этапу
 

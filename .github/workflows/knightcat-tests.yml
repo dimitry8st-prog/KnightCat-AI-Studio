@@ -1,0 +1,20 @@
+name: KnightCat tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  vk-publisher:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run VK publisher tests
+        run: node --test n8n/vk/vk-publisher.test.cjs

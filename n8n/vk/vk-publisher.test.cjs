@@ -1,10 +1,12 @@
 'use strict';
 
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const test = require('node:test');
 const publisher = require('./vk-publisher.cjs');
+const { sha256Hex } = require('./image-sha256.cjs');
 const http = require('./vk-http.cjs');
 const { syncWorkflow } = require('./sync-workflow.cjs');
 
@@ -353,6 +355,26 @@ test('пакет без лимитов и без изображения не д�
   assert.strictEqual(publisher.readDraftImage(pkg), null);
 });
 
+test('внутренний отпечаток не называется SHA-256, а sha256Hex совпадает с crypto', () => {
+  const bytes = jpeg(80, 40);
+  const inspected = publisher.inspectImage(bytes, 'photo.jpg');
+  const real = crypto.createHash('sha256').update(bytes).digest('hex');
+  assert.strictEqual(inspected.ok, true);
+  assert.strictEqual(sha256Hex(bytes), real);
+  assert.strictEqual(inspected.image.fingerprint.length, 16);
+  assert.notStrictEqual(inspected.image.fingerprint, real);
+  assert.strictEqual(Object.hasOwn(inspected.image, 'sha256'), false);
+  const pkg = draft();
+  const flow = arm(pkg);
+  assert.strictEqual(typeof pkg.publication.vk.content_fingerprint, 'string');
+  assert.strictEqual(pkg.publication.vk.content_sha256, undefined);
+  publisher.acceptWallPost(pkg, { lockToken: flow.token, groupId: '123', body: posted, now: NOW });
+  assert.strictEqual(publisher.claimPublication(pkg, { now: LATER }).action, 'already_published');
+  const plan = publisher.planResolve(pkg, '91');
+  assert.strictEqual(plan.http, false);
+  assert.strictEqual(plan.action, 'stop');
+});
+
 test('размеры JPEG, PNG и слишком узкого кадра проверяются до сохранения', () => {
   const png = Buffer.alloc(24);
   png.write('PNG', 1, 'ascii');
@@ -475,7 +497,7 @@ test('workflow n8n: HTTP Request, фото черновика, без HTTP вн�
 
   for (const node of workflow.nodes) {
     if (!node.parameters || !node.parameters.jsCode) continue;
-    assert.doesNotMatch(node.parameters.jsCode, /helpers\.httpRequest|createN8nVkClient|\bfetch\s*\(/, node.name);
+    assert.doesNotMatch(node.parameters.jsCode, /helpers\.httpRequest|createN8nVkClient|\bfetch\s*\(|\brequire\s*\(/, node.name);
   }
   const raw = JSON.stringify(workflow);
   assert.doesNotMatch(raw, /vk1\.[A-Za-z0-9_-]{10,}/);

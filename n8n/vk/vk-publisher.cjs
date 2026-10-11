@@ -25,7 +25,7 @@ function emptyVkPublication() {
     url: null,
     attachment: null,
     guid: null,
-    content_sha256: null,
+    content_fingerprint: null,
     locked_at: null,
     lock_token: null,
     lock_seq: 0,
@@ -247,7 +247,7 @@ function inspectImage(bytes, filename) {
       byte_length: data.length,
       width: size.width,
       height: size.height,
-      sha256: fnvHex(data)
+      fingerprint: fnvHex(data)
     },
     bytes: data
   };
@@ -489,8 +489,8 @@ function prepareGetUploadServer(pkg, options) {
     clearLock(vk);
     return Object.assign(resultOf(pkg, 'failed'), { ready: false });
   }
-  const contentSha = fnvHex(check.text + '\n' + check.image.image.sha256);
-  vk.content_sha256 = contentSha;
+  const contentSha = fnvHex(check.text + '\n' + check.image.image.fingerprint);
+  vk.content_fingerprint = contentSha;
   vk.guid = makeGuid(pkg.request_id, contentSha);
   vk.status = 'uploading';
   vk.locked_at = opts.now || new Date().toISOString();
