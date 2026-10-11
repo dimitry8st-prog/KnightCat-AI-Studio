@@ -63,6 +63,72 @@
       "guard": "no_llm_call_and_no_publication"
     },
     {
+      "id": "vk_approve_with_image",
+      "input": "Одобренный черновик с текстом VK и JPEG",
+      "execution": "local_stub",
+      "expected": [
+        "one_vk_wall_post",
+        "community_attachment",
+        "saved_post_url"
+      ],
+      "guard": "from_group_and_negative_owner"
+    },
+    {
+      "id": "vk_duplicate_approve",
+      "input": "Повторный /approve уже опубликованного черновика",
+      "execution": "local_stub",
+      "expected": [
+        "existing_vk_url"
+      ],
+      "guard": "no_second_wall_post"
+    },
+    {
+      "id": "vk_parallel_approve",
+      "input": "Второй approve, пока wall.post ещё не ответил",
+      "execution": "local_stub",
+      "expected": [
+        "in_progress"
+      ],
+      "guard": "no_second_wall_post"
+    },
+    {
+      "id": "vk_reject",
+      "input": "/reject REQUEST_ID",
+      "execution": "local_stub",
+      "expected": [
+        "status_rejected"
+      ],
+      "guard": "no_vk_api_call"
+    },
+    {
+      "id": "vk_invalid_token",
+      "input": "photos.getWallUploadServer возвращает ошибку 5",
+      "execution": "local_stub",
+      "expected": [
+        "auth_error_message"
+      ],
+      "guard": "no_wall_post"
+    },
+    {
+      "id": "vk_upload_error",
+      "input": "Сервер загрузки возвращает ошибку 22",
+      "execution": "local_stub",
+      "expected": [
+        "upload_error_message"
+      ],
+      "guard": "no_wall_post"
+    },
+    {
+      "id": "vk_publish_timeout",
+      "input": "Тайм-аут после запроса wall.post",
+      "execution": "local_stub",
+      "expected": [
+        "status_uncertain",
+        "reconcile_without_new_post"
+      ],
+      "guard": "no_blind_retry"
+    },
+    {
       "id": "invalid_model_json",
       "input": "Смоделированный ответ OpenRouter без корректного JSON",
       "expected": [
