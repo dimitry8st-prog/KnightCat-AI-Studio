@@ -44,6 +44,13 @@ if (!isAllowed) {
   }}];
 }
 
+const photos = Array.isArray(message.photo) ? message.photo : [];
+const sourcePhotoFileId = photos.reduce((best, item) => {
+  if (!item || !item.file_id) return best;
+  if (!best || (item.file_size || 0) > (best.file_size || 0)) return item;
+  return best;
+}, null);
+
 const approve = text.match(/^\/approve(?:\s+([\w-]+))?$/i);
 const reject = text.match(/^\/reject(?:\s+([\w-]+))?$/i);
 const resolve = text.match(/^\/vk-resolve(?:\s+([\w-]+))?(?:\s+([0-9]+|absent))?$/i);
@@ -76,9 +83,10 @@ return [{ json: {
   source_chat_id: chatId,
   user_id: userId,
   message_id: messageId,
+  source_photo_file_id: sourcePhotoFileId ? String(sourcePhotoFileId.file_id) : null,
   received_at: new Date().toISOString(),
   config,
   user_message: eventType === 'unsupported'
-    ? 'Отправьте идею обычным сообщением. /approve ID публикует, /reject ID отклоняет. Если исход стены неизвестен: /vk-resolve ID, /vk-resolve ID POST_ID или /vk-resolve ID absent.'
+    ? 'Отправьте идею текстом. Фотографию приложите к этому же сообщению: она сохранится в черновике и уйдёт на стену ВКонтакте. /approve ID публикует, /reject ID отклоняет. Если исход стены неизвестен: /vk-resolve ID POST_ID.'
     : null
 }}];
