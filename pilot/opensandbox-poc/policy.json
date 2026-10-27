@@ -1,0 +1,27 @@
+{
+  "profile": "local-restricted-process",
+  "official_project": "https://github.com/opensandbox-group/OpenSandbox",
+  "installed_on_server": false,
+  "limits": {
+    "cpu": "0.5",
+    "memory": "128Mi",
+    "timeout_ms": 1000,
+    "max_source_bytes": 20000,
+    "max_output_chars": 4000
+  },
+  "rights": {
+    "network": false,
+    "secrets": false,
+    "working_databases": false,
+    "filesystem": "temp-dir-only"
+  },
+  "denied_patterns": [
+    "process.env",
+    "fetch(",
+    "require(",
+    "import ",
+    "child_process",
+    "net.",
+    "fs."
+  ]
+}

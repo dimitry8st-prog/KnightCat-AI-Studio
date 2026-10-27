@@ -1,0 +1,23 @@
+{
+  "default_model": "knightcat-default",
+  "timeout_ms": 20000,
+  "max_attempts": 2,
+  "models": {
+    "knightcat-default": {
+      "provider": "openrouter",
+      "model_env": "KNIGHTCAT_OPENROUTER_MODEL",
+      "model_default": "openai/gpt-4.1-mini",
+      "base_url_env": "OPENROUTER_BASE_URL",
+      "base_url_default": "https://openrouter.ai/api/v1/chat/completions",
+      "api_key_env": "OPENROUTER_API_KEY"
+    },
+    "qwen": {
+      "provider": "qwen",
+      "model_env": "QWEN_MODEL",
+      "model_default": "qwen-plus",
+      "base_url_env": "QWEN_BASE_URL",
+      "base_url_default": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+      "api_key_env": "QWEN_API_KEY"
+    }
+  }
+}
