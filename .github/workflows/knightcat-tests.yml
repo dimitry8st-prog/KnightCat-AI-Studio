@@ -18,3 +18,14 @@ jobs:
           node-version: "22"
       - name: Run VK publisher tests
         run: node --test n8n/vk/vk-publisher.test.cjs
+
+  aaif-pilot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run AAIF pilot tests
+        run: node --test pilot/model-gateway/gateway.test.mjs pilot/opensandbox-poc/runner.test.mjs
